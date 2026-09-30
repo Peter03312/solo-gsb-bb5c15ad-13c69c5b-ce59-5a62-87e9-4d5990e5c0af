@@ -13,9 +13,24 @@ const state = {
   speed: 1,
   rafId: null,
   lastWall: 0,
+  // 临时调光：记录列表 + 当前打开的记录工作区（快照与操作序列重算结果）
+  ovRecords: [],
+  ov: null,
+  ovTime: 0,
+  ovPlaying: false,
+  ovRafId: null,
+  ovLastWall: 0,
 };
 
 /* ------------------------------- API ------------------------------- */
+
+class ApiError extends Error {
+  constructor(message, status, revision) {
+    super(message);
+    this.status = status;
+    this.revision = revision;
+  }
+}
 
 async function api(method, url, body) {
   const res = await fetch(url, {
@@ -25,7 +40,7 @@ async function api(method, url, body) {
   });
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `请求失败（${res.status}）`);
+  if (!res.ok) throw new ApiError(data.error || `请求失败（${res.status}）`, res.status, res.headers.get('X-Record-Revision'));
   return data;
 }
 
@@ -213,6 +228,7 @@ async function loadVersions({ keepSelection = true } = {}) {
   renderVersions();
   renderVersionOptions(keepSelection ? prev : null);
   renderCompareOptions();
+  renderOverrideVersionOptions();
   if (keepSelection) {
     if (state.versions.some((v) => String(v.id) === String(prevA))) $('cmp-version-a').value = prevA;
     if (state.versions.some((v) => String(v.id) === String(prevB))) $('cmp-version-b').value = prevB;
@@ -536,6 +552,311 @@ function renderCompare(d) {
   $('cmp-config').innerHTML = cfgHtml || '<p class="muted">两版灯具配置一致。</p>';
 }
 
+/* ----------------------------- 临时调光 ----------------------------- */
+
+const OV_STORAGE_KEY = 'ov-selected-record';
+
+async function loadOverrideRecords({ preferId = null } = {}) {
+  state.ovRecords = await api('GET', '/api/override-records');
+  renderOverrideRecords();
+  renderOverrideVersionOptions();
+  const want = preferId || localStorage.getItem(OV_STORAGE_KEY);
+  if (want && state.ovRecords.some((r) => String(r.id) === String(want))) {
+    await openOverrideRecord(want);
+  }
+}
+
+function renderOverrideVersionOptions() {
+  const sel = $('ov-version');
+  if (state.versions.length === 0) {
+    sel.innerHTML = '<option value="">— 请先发布一个版本 —</option>';
+    return;
+  }
+  sel.innerHTML = state.versions
+    .map((v) => `<option value="${v.id}">#${v.id} ${esc(v.label)}（${v.cue_count} 条 Cue）</option>`)
+    .join('');
+}
+
+function renderOverrideRecords() {
+  const tb = $('ov-record-table').querySelector('tbody');
+  if (state.ovRecords.length === 0) {
+    tb.innerHTML = '<tr><td colspan="6" class="muted">还没有临时调光记录。</td></tr>';
+    return;
+  }
+  tb.innerHTML = state.ovRecords
+    .map((r) => {
+      const active = state.ov && String(state.ov.id) === String(r.id);
+      return `
+      <tr class="${active ? 'fading' : ''}">
+        <td>#${r.id}</td>
+        <td>${esc(r.name)}</td>
+        <td>#${r.version_id} ${esc(r.version_label)}</td>
+        <td>${r.revision}</td>
+        <td>${new Date(r.created_at * 1000).toLocaleString('zh-CN', { hour12: false })}</td>
+        <td><button data-ov-open="${r.id}">${active ? '当前打开' : '打开'}</button></td>
+      </tr>`;
+    })
+    .join('');
+}
+
+async function openOverrideRecord(id) {
+  clearErr($('ov-op-error'));
+  const rec = await api('GET', `/api/override-records/${id}`);
+  const baseCues = Engine.prepareCues(rec.cues);
+  const ops = Engine.prepareOperations(baseCues, rec.lights, rec.operations);
+  state.ov = {
+    ...rec,
+    baseCues,
+    ops,
+    duration: Engine.overrideShowDuration(baseCues, ops),
+  };
+  localStorage.setItem(OV_STORAGE_KEY, String(id));
+  if (state.ovTime > state.ov.duration) state.ovTime = state.ov.duration;
+  $('ov-workspace').hidden = false;
+  $('ov-title').textContent = `临时调光记录 #${rec.id}：${rec.name}`;
+  $('ov-meta').textContent =
+    `绑定版本 #${rec.version_id}（${rec.version.label}）的不可变快照 · ` +
+    `修订号 ${rec.revision} · ${rec.operations.length} 条操作 · ` +
+    `跳转或刷新后按快照与操作序列整体重算`;
+  $('ov-light').innerHTML = rec.lights
+    .map((l) => `<option value="${l.id}">#${l.id} ${esc(l.name)}</option>`)
+    .join('');
+  const tl = $('ov-timeline');
+  tl.max = String(Math.max(state.ov.duration, 0));
+  $('ov-time-total').textContent = fmt(state.ov.duration);
+  updateOpFormHints();
+  renderOverrideRecords();
+  renderOverrideWorkspace();
+}
+
+function updateOpFormHints() {
+  const last = state.ov && state.ov.operations.length ? state.ov.operations[state.ov.operations.length - 1] : null;
+  $('ov-revision-hint').textContent = String(state.ov ? state.ov.revision : 0);
+  $('ov-last-time-hint').textContent = last ? `${fmt(last.time)} s` : '—（首条可从任意非负时码开始）';
+  const minT = last ? last.time : 0;
+  $('ov-time').min = String(minT);
+  if (Number($('ov-time').value) < minT) $('ov-time').value = fmt(minT);
+}
+
+$('form-ov-record').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearErr($('ov-record-error'));
+  const version_id = $('ov-version').value;
+  if (!version_id) return showErr($('ov-record-error'), '还没有已发布版本，请先到「发布版本」页冻结一版。');
+  try {
+    const rec = await api('POST', '/api/override-records', {
+      version_id,
+      name: $('ov-record-name').value,
+    });
+    $('ov-record-name').value = '';
+    state.ovTime = 0;
+    pauseOverride();
+    await loadOverrideRecords({ preferId: rec.id });
+  } catch (e2) {
+    showErr($('ov-record-error'), e2.message);
+  }
+});
+
+$('ov-record-table').addEventListener('click', async (e) => {
+  const id = e.target.dataset?.ovOpen;
+  if (!id) return;
+  clearErr($('ov-op-error'));
+  try {
+    state.ovTime = 0;
+    pauseOverride();
+    await openOverrideRecord(id);
+  } catch (e2) {
+    showErr($('ov-op-error'), e2.message);
+  }
+});
+
+$('ov-kind').addEventListener('change', () => {
+  const isOverride = $('ov-kind').value === 'override';
+  $('ov-target').required = isOverride;
+  $('ov-target-label').style.opacity = isOverride ? '1' : '.45';
+});
+
+$('form-ov-op').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearErr($('ov-op-error'));
+  if (!state.ov) return showErr($('ov-op-error'), '请先打开一个临时调光记录。');
+  const kind = $('ov-kind').value;
+  const op = {
+    light_id: Number($('ov-light').value),
+    time: $('ov-time').value,
+    kind,
+    duration: $('ov-duration').value,
+  };
+  if (kind === 'override') op.target = $('ov-target').value;
+  try {
+    const rec = await api('POST', `/api/override-records/${state.ov.id}/operations`, {
+      revision: state.ov.revision,
+      operations: [op],
+    });
+    // 成功：以服务端返回的完整记录重建工作区（不做本地乐观假设）
+    const baseCues = Engine.prepareCues(rec.cues);
+    const ops = Engine.prepareOperations(baseCues, rec.lights, rec.operations);
+    state.ov = {
+      ...rec,
+      baseCues,
+      ops,
+      duration: Engine.overrideShowDuration(baseCues, ops),
+    };
+    $('ov-timeline').max = String(Math.max(state.ov.duration, 0));
+    $('ov-time-total').textContent = fmt(state.ov.duration);
+    updateOpFormHints();
+    state.ovRecords = await api('GET', '/api/override-records');
+    renderOverrideRecords();
+    renderOverrideWorkspace();
+  } catch (e2) {
+    if (e2.status === 409) {
+      showErr($('ov-op-error'), `提交冲突，操作未写入：${e2.message}。已为你重新加载最新操作序列。`);
+      await openOverrideRecord(state.ov.id).catch(() => {});
+    } else {
+      showErr($('ov-op-error'), '提交被拒绝：' + e2.message);
+    }
+  }
+});
+
+/* -------- 临时调光工作区：播放 / 跳转 / 逐灯输出（快照+操作序列重算） -------- */
+
+function ovTick(ts) {
+  if (!state.ovPlaying) return;
+  const dt = (ts - state.ovLastWall) / 1000;
+  state.ovLastWall = ts;
+  state.ovTime += dt;
+  if (state.ovTime >= state.ov.duration) {
+    state.ovTime = state.ov.duration;
+    state.ovPlaying = false;
+    renderOverrideWorkspace();
+    return;
+  }
+  renderOverrideWorkspace();
+  state.ovRafId = requestAnimationFrame(ovTick);
+}
+
+$('ov-btn-play').addEventListener('click', () => {
+  clearErr($('ov-op-error'));
+  if (!state.ov) return showErr($('ov-op-error'), '请先打开一个临时调光记录。');
+  if (state.ovTime >= state.ov.duration) state.ovTime = 0;
+  if (state.ov.duration === 0) {
+    state.ovTime = 0;
+    renderOverrideWorkspace();
+    return;
+  }
+  state.ovPlaying = true;
+  state.ovLastWall = performance.now();
+  state.ovRafId = requestAnimationFrame(ovTick);
+});
+
+$('ov-btn-pause').addEventListener('click', pauseOverride);
+function pauseOverride() {
+  state.ovPlaying = false;
+  if (state.ovRafId) cancelAnimationFrame(state.ovRafId);
+}
+
+$('ov-btn-stop').addEventListener('click', () => {
+  pauseOverride();
+  state.ovTime = 0;
+  renderOverrideWorkspace();
+});
+
+$('ov-timeline').addEventListener('input', (e) => {
+  if (!state.ov) return;
+  state.ovTime = Math.min(Math.max(Number(e.target.value), 0), state.ov.duration);
+  renderOverrideWorkspace();
+});
+
+$('ov-btn-jump').addEventListener('click', () => {
+  clearErr($('ov-op-error'));
+  if (!state.ov) return showErr($('ov-op-error'), '请先打开一个临时调光记录。');
+  const t = Number($('ov-jump-time').value);
+  if (!Number.isFinite(t)) return showErr($('ov-op-error'), '跳转时刻必须是数字。');
+  if (t < 0) return showErr($('ov-op-error'), `非法时码：${$('ov-jump-time').value}（不得为负）。`);
+  state.ovTime = Math.min(t, state.ov.duration);
+  renderOverrideWorkspace();
+});
+
+function opStatusText(op, t) {
+  const end = op.time + op.duration;
+  if (t < op.time) return '<span class="badge waiting">等待</span>';
+  if (op.duration > 0 && t < end) {
+    return op.kind === 'override'
+      ? '<span class="badge fading">覆盖渐变中</span>'
+      : '<span class="badge fading">归还融合中</span>';
+  }
+  return op.kind === 'override'
+    ? '<span class="badge done">覆盖保持</span>'
+    : '<span class="badge done">已跟随原版</span>';
+}
+
+function renderOverrideWorkspace() {
+  const w = state.ov;
+  const t = state.ovTime;
+  $('ov-time-current').textContent = fmt(t);
+  $('ov-timeline').value = String(t);
+  if (!w) return;
+
+  const nameOf = {};
+  w.lights.forEach((l) => (nameOf[l.id] = l.name));
+
+  // 舞台模拟（叠加操作后的实际输出）
+  $('ov-stage').innerHTML = w.lights
+    .map((l) => {
+      const v = Engine.overrideBrightnessAt(w.baseCues, w.ops, l.id, t);
+      const shown = Math.round(v * 10) / 10;
+      const a = v / 100;
+      return `
+        <div class="lamp">
+          <div class="beam" style="
+              background: rgba(245,185,66,${(0.05 + a * 0.95).toFixed(3)});
+              box-shadow: 0 0 ${(12 + a * 46).toFixed(0)}px rgba(245,185,66,${(a * 0.85).toFixed(3)});
+              border-color: rgba(245,185,66,${(0.2 + a * 0.6).toFixed(3)});
+              color: ${a > 0.5 ? '#2a1d04' : '#555'};">${fmt(shown)}</div>
+          <div class="name" title="${esc(l.name)}">#${l.id} ${esc(l.name)}</div>
+        </div>`;
+    })
+    .join('');
+
+  // 各灯亮度：实际（叠加临时调光）/ 后台原版
+  $('ov-levels').innerHTML = w.lights
+    .map((l) => {
+      const v = Engine.overrideBrightnessAt(w.baseCues, w.ops, l.id, t);
+      const base = Engine.brightnessAt(w.baseCues, l.id, t);
+      const touched = v !== base;
+      return `
+        <div class="level-item">
+          <label>
+            <span>#${l.id} ${esc(l.name)}${touched ? ' <span class="badge fading">临时</span>' : ''}</span>
+            <span class="v">${fmt(v)} <span class="muted">/ ${fmt(base)}</span></span>
+          </label>
+          <div class="level-track"><div class="level-fill" style="width:${v.toFixed(2)}%"></div></div>
+        </div>`;
+    })
+    .join('');
+
+  // 操作列表与当前状态
+  $('ov-op-table').querySelector('tbody').innerHTML = w.operations
+    .map((op) => {
+      const fading = op.duration > 0 && t >= op.time && t < op.time + op.duration;
+      const done = t >= op.time && !(op.duration > 0 && t < op.time + op.duration);
+      const kindBadge = op.kind === 'override'
+        ? '<span class="badge fading">覆盖</span>'
+        : '<span class="badge done">归还</span>';
+      return `
+        <tr class="${fading ? 'fading' : done ? 'done' : ''}">
+          <td>${op.seq}</td>
+          <td>#${op.light_id} ${esc(nameOf[op.light_id] || '?')}</td>
+          <td>${fmt(op.time)}</td>
+          <td>${kindBadge}</td>
+          <td>${op.kind === 'override' ? fmt(op.target) : '—'}</td>
+          <td>${fmt(op.duration)}</td>
+          <td>${opStatusText(op, t)}</td>
+        </tr>`;
+    })
+    .join('');
+}
+
 /* ----------------------------- 启动 ----------------------------- */
 
 (async function init() {
@@ -551,6 +872,8 @@ function renderCompare(d) {
     renderVersions();
     renderVersionOptions(null);
     renderCompareOptions();
+    renderOverrideVersionOptions();
+    await loadOverrideRecords();
     if (state.versions.length > 0) {
       await loadSession(state.versions[0].id, true); // 默认加载最新版本，停在 0 秒
     } else {

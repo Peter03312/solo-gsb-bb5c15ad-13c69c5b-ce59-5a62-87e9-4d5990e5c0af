@@ -107,6 +107,104 @@
     return d;
   }
 
+  /* ----------- 临时调光记录：在原版 Cue 之上叠加“覆盖 / 归还”操作 ----------- */
+
+  /**
+   * 计算某个调光操作在 t（>= op.time）时刻给出的实际输出。
+   * baseCues 为 prepareCues 后的原版 Cue（始终在后台按既有规则运行）。
+   *
+   *  - 覆盖（override）：从操作瞬间的实际输出 op.from 线性渐变到 target，此后保持。
+   *  - 归还（return）：以 op.from 为固定锚点，在 duration 内按进度与“该时刻持续
+   *    变化的原版亮度”线性融合；结束后完全跟随原版。
+   *  - duration 为 0 时立即生效：覆盖即刻到 target，归还即刻等于原版亮度。
+   */
+  function operationValue(op, t, baseCues) {
+    const baseAt = (tt) => brightnessAt(baseCues, op.lightId, tt);
+    if (op.duration === 0) {
+      return op.kind === 'override' ? op.target : clamp(baseAt(t));
+    }
+    if (t >= op.end) {
+      return op.kind === 'override' ? op.target : clamp(baseAt(t));
+    }
+    // t === op.time 时 p = 0，取操作起点实际输出（无跳变）
+    const p = (t - op.time) / op.duration;
+    if (op.kind === 'override') {
+      return clamp(op.from + (op.target - op.from) * p);
+    }
+    return clamp(op.from * (1 - p) + baseAt(t) * p);
+  }
+
+  /**
+   * 整理一条临时调光记录的操作序列：
+   * 全局按（时码 time, 追加序号 seq）排序——同秒操作按追加顺序生效；
+   * 并为每盏灯逐条计算每个操作起点瞬间的“实际输出”：
+   * 下一操作可在上一操作尚未结束的渐变中途直接接管（不跳变、不重置），
+   * 规则与原版 Cue 的中途接管一致。
+   *
+   * op 字段：{ seq, light_id, time, kind: 'override' | 'return', duration, target? }
+   * target 仅覆盖操作需要；不属于绑定版本快照灯具的操作被忽略（正常不会出现）。
+   */
+  function prepareOperations(baseCues, lights, operations) {
+    const known = new Set((lights || []).map((l) => l.id));
+    const ordered = operations
+      .filter((o) => known.has(o.light_id))
+      .map((o) => ({
+        seq: Number(o.seq),
+        lightId: o.light_id,
+        time: Number(o.time),
+        kind: o.kind,
+        duration: Number(o.duration),
+        end: Number(o.time) + Number(o.duration),
+        target: o.kind === 'override' ? clamp(Number(o.target)) : null,
+        from: 0, // 操作起点瞬间的实际输出，下面按灯逐条计算
+      }))
+      .sort((a, b) => a.time - b.time || a.seq - b.seq);
+
+    const last = new Map();
+    for (const op of ordered) {
+      const prev = last.get(op.lightId);
+      op.from = prev
+        ? operationValue(prev, op.time, baseCues) // 同秒/中途接管：取上一操作此刻实际输出
+        : clamp(brightnessAt(baseCues, op.lightId, op.time));
+      last.set(op.lightId, op);
+    }
+    return ordered;
+  }
+
+  /**
+   * 叠加临时调光操作后，t 秒时某盏灯的实际亮度：
+   * 找到该灯“时码 <= t”的最后一条操作（当前生效操作）；
+   * 不存在操作时完全等于后台原版 Cue 的亮度。
+   */
+  function overrideBrightnessAt(baseCues, orderedOps, lightId, t) {
+    let active = null;
+    for (const op of orderedOps) {
+      if (op.lightId !== lightId) continue;
+      if (op.time > t) break; // 全局已按 time, seq 排序
+      active = op;
+    }
+    if (!active) return brightnessAt(baseCues, lightId, t);
+    return operationValue(active, t, baseCues);
+  }
+
+  /** 叠加临时调光后，t 秒所有灯具的实际亮度表 { lightId: brightness } */
+  function overrideLevelsAt(baseCues, orderedOps, lights, t) {
+    const out = {};
+    for (const l of lights) {
+      out[l.id] = overrideBrightnessAt(baseCues, orderedOps, l.id, t);
+    }
+    return out;
+  }
+
+  /** 记录重算的时间轴长度：原版结束时刻与所有操作结束时刻的较大者 */
+  function overrideShowDuration(baseCues, orderedOps) {
+    let d = showDuration(baseCues);
+    for (const op of orderedOps) {
+      if (op.end > d) d = op.end;
+    }
+    return d;
+  }
+
   /* --------------------- 两版亮度差区间（精确解析解） --------------------- */
 
   // 浮点容差：用于“本应相等”的端点归类（阈值交点、重复转折点），
@@ -267,6 +365,10 @@
     brightnessAt,
     levelsAt,
     showDuration,
+    prepareOperations,
+    overrideBrightnessAt,
+    overrideLevelsAt,
+    overrideShowDuration,
     differenceIntervals,
   };
 });

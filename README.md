@@ -3,6 +3,8 @@
 一款用于小剧场灯光排演的 Web 应用。录入**灯具**与按演出秒数触发的 **Cue**
 （灯具编号、目标亮度、非负渐变时长），所有灯光效果都在浏览器中模拟，**无需连接任何真实灯具**。
 支持播放 / 暂停 / 跳转，并实时显示任意时刻每盏灯的实际亮度；发布后生成**不可变演出版本**。
+排演人员还可针对已发布版本建立**临时调光记录**，按演出时码追加灯具的“覆盖 / 归还”操作，
+查看任意时刻的逐灯实际输出（操作可中途接管，提交带修订号，刷新后按版本快照重算）。
 
 技术栈：Node.js + Express + SQLite（better-sqlite3），原生 HTML/CSS/JS 前端，无前端构建步骤。
 
@@ -85,6 +87,87 @@ npm test                  # 运行灯光渐变引擎单元测试
    无差异返回空区间；零长度时窗只返回该时刻亮度。区间在转折点（Cue 触发时刻、渐变结束时刻）
    之间用一次方程求阈值交点，**不做固定间隔采样**，同秒编号顺序、瞬变、中途接管、线性渐变
    规则与播放器完全一致。比对只读发布快照，不修改草稿，也不影响任何播放会话。
+6. **临时调光**：针对任意**已发布版本**建立独立的临时调光记录（记录创建时即绑定该版本的
+   不可变快照；之后修改草稿或发布新版本都不改变既有记录）。在记录中按演出时码为指定灯具
+   追加两类操作：
+   - **覆盖（override）**：从操作瞬间该灯的**实际输出**线性渐变到 0～100 的目标亮度，渐变
+     结束后保持；后台原版 Cue 仍按既有规则持续运行，不受影响。
+   - **归还（return）**：以操作瞬间的实际输出为固定起点，在指定时长内按进度与**该时刻持续
+     变化的原版亮度**线性融合（`(1-p)×起点 + p×原版(t)`），时长结束后完全跟随原版。
+   - 时长为 `0` 秒时立即生效：覆盖即刻跳到目标，归还即刻等于当前原版亮度。
+   - **同秒按追加顺序生效**；下一操作可在上一操作未完成的渐变**中途接管**（从当时实际输出
+     直接转向，不跳变）——与原版 Cue 的接管语义一致。
+   - 仅允许追加**时码不早于记录末项**的操作；每次提交必须携带**记录修订号**（= 已追加操作
+     数，初始为 0；成功追加 N 条后变为 +N）。过期修订号返回 **409 冲突**且**不写入**。
+   - 跳转 / 暂停 / 拖动时间轴，或刷新页面重新打开记录时，均按绑定版本快照与操作序列
+     **整体重算**逐灯实际输出；页面同时展示叠加后的实际亮度与后台原版亮度。
+
+## 临时调光 HTTP API
+
+所有写操作均为整次事务：参数非法（负时码、负时长、未知灯具、覆盖缺目标亮度、时码早于
+末项等）返回 `400` 且**整次提交不部分写入**；记录不存在返回 `404`；修订号过期返回 `409`，
+响应头 `X-Record-Revision` 给出当前最新修订号。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/override-records` | 建立记录 `{version_id, name?}`（版本须已发布，否则 404；name 可留空自动命名） |
+| GET | `/api/override-records` | 记录列表（含绑定版本、修订号） |
+| GET | `/api/override-records/:id` | 记录详情：绑定版本快照（灯具+原版 Cue）+ 全部操作，供整体重算 |
+| POST | `/api/override-records/:id/operations` | 追加操作 `{revision, operations:[...]}`，成功返回更新后的完整记录（201） |
+
+操作对象字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `light_id` | 灯具编号，必须存在于绑定版本的快照中 |
+| `time` | 非负演出时码（秒，可小数）；不得早于记录末项，批内同样按顺序单调 |
+| `kind` | `"override"`（覆盖）或 `"return"`（归还）；也接受中文 `"覆盖"` / `"归还"` |
+| `duration` | 非负时长（秒）；`0` 立即生效 |
+| `target` | 目标亮度 0～100；**仅覆盖操作必填**，归还时忽略 |
+
+调用示例：
+
+```bash
+# 1) 针对版本 #1 建立临时调光记录
+curl -X POST http://localhost:3000/api/override-records \
+  -H 'Content-Type: application/json' \
+  -d '{"version_id":1,"name":"今晚临时处理"}'
+# -> 201，记录 id=1，revision=0，operations=[]
+
+# 2) 携带修订号追加操作：t=5s 把 #1 号灯从当时实际输出渐变到 0，用时 10 秒
+curl -X POST http://localhost:3000/api/override-records/1/operations \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":0,"operations":[
+        {"light_id":1,"time":5,"kind":"override","duration":10,"target":0}
+      ]}'
+# -> 201，返回完整记录，revision 变为 1
+
+# 3) 批量追加（整批事务；可同秒，同秒按数组顺序生效）：先覆盖、再归还
+curl -X POST http://localhost:3000/api/override-records/1/operations \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":1,"operations":[
+        {"light_id":2,"time":6,"kind":"覆盖","duration":0,"target":30},
+        {"light_id":1,"time":7,"kind":"return","duration":3}
+      ]}'
+
+# 4) 跳转/刷新后取回快照与操作序列，逐灯重算任意时刻实际输出（GET 只读）
+curl http://localhost:3000/api/override-records/1
+```
+
+过期修订号：
+
+```bash
+curl -i -X POST http://localhost:3000/api/override-records/1/operations \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":0,"operations":[{"light_id":1,"time":9,"kind":"归还","duration":0}]}'
+# HTTP/1.1 409 Conflict
+# X-Record-Revision: 2
+# {"error":"修订号已过期：提交基于 0，当前为 2"}
+```
+
+前端「临时调光」页提供与 API 等价的操作：建立记录、按当前修订号追加覆盖/归还、
+播放/跳转查看逐灯实际输出（实际/原版双列）与操作状态（等待 / 覆盖渐变中 / 归还融合中 /
+覆盖保持 / 已跟随原版）。冲突时页面提示并自动重新加载最新操作序列。
 
 ## 版本比对 HTTP API
 
@@ -152,20 +235,26 @@ curl -X POST http://localhost:3000/api/compare \
 | GET | `/api/versions` | 版本列表 |
 | GET | `/api/versions/:id` | 版本完整快照（灯具 + Cue，供播放器使用） |
 | GET/POST | `/api/compare` | 两版亮度差异比对（查看时刻逐灯亮度 + 超差连续区间 + 配置差异），只读 |
+| POST | `/api/override-records` | 针对已发布版本建立临时调光记录（绑定不可变快照） |
+| GET | `/api/override-records` | 临时调光记录列表 |
+| GET | `/api/override-records/:id` | 记录详情（版本快照 + 操作序列，供重算） |
+| POST | `/api/override-records/:id/operations` | 携带修订号追加覆盖/归还操作（整次事务，过期 409 不写入） |
 
 所有错误返回 `400/404/409` 与形如 `{"error": "具体中文原因"}` 的 JSON。
 
 ## 目录结构
 
 ```
-server.js            Express 服务与 API、输入校验、版本快照事务、两版比对
+server.js            Express 服务与 API、输入校验、版本快照事务、两版比对、临时调光记录与修订号冲突控制
 src/db.js            SQLite 初始化与表结构
-public/engine.js     纯函数灯光渐变引擎（浏览器/Node 共用，含线性渐变、中途接管与精确差值区间）
+public/engine.js     纯函数灯光渐变引擎（浏览器/Node 共用，含线性渐变、中途接管、精确差值区间，
+                     以及临时调光的覆盖/归还叠加与按快照+操作序列重算）
 public/index.html    单页界面
 public/styles.css    剧场暗色主题
-public/app.js        前端交互、版本比对页与基于 requestAnimationFrame 的播放器
+public/app.js        前端交互、版本比对页、基于 requestAnimationFrame 的播放器与临时调光工作区
 test/engine.test.js  渐变规则单元测试
 test/compare.test.js 两版亮度差区间单元测试（交点精度、端点包含性、瞬变、接管）
+test/override.test.js 临时调光覆盖/归还/接管/同秒顺序/重算单元测试
 Dockerfile           镜像构建（依赖、初始化、启动）
 docker-compose.yml   一键编排
 ```
