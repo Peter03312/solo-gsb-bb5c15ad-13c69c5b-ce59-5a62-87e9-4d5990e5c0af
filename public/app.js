@@ -6,6 +6,10 @@ const state = {
   lights: [],
   cues: [],
   versions: [],
+  records: [],
+  // 当前打开的临时调光记录：detail 含绑定快照与操作序列，baseCues/byLight 为重算结果
+  record: null,
+  recordTime: 0,
   // 播放器会话：一旦开始播放，快照与排序后的 Cue 即冻结，草稿/新发布不影响本次播放
   session: null,
   time: 0,
@@ -213,6 +217,7 @@ async function loadVersions({ keepSelection = true } = {}) {
   renderVersions();
   renderVersionOptions(keepSelection ? prev : null);
   renderCompareOptions();
+  renderRecordVersionOptions();
   if (keepSelection) {
     if (state.versions.some((v) => String(v.id) === String(prevA))) $('cmp-version-a').value = prevA;
     if (state.versions.some((v) => String(v.id) === String(prevB))) $('cmp-version-b').value = prevB;
@@ -536,14 +541,285 @@ function renderCompare(d) {
   $('cmp-config').innerHTML = cfgHtml || '<p class="muted">两版灯具配置一致。</p>';
 }
 
+/* ------------------------- 临时调光记录（覆盖/归还） ------------------------- */
+
+const HASH_RECORD = 'record';
+const HASH_TIME = 't';
+
+function readHash() {
+  const out = {};
+  window.location.hash
+    .replace(/^#/, '')
+    .split('&')
+    .filter(Boolean)
+    .forEach((kv) => {
+      const [k, v] = kv.split('=');
+      out[decodeURIComponent(k)] = decodeURIComponent(v ?? '');
+    });
+  return out;
+}
+
+function writeHash(recId, t) {
+  const parts = [`${HASH_RECORD}=${recId}`];
+  if (t > 0) parts.push(`${HASH_TIME}=${t}`);
+  history.replaceState(null, '', `#${parts.join('&')}`);
+}
+
+function renderRecordVersionOptions() {
+  const sel = $('rec-version');
+  if (state.versions.length === 0) {
+    sel.innerHTML = '<option value="">— 暂无已发布版本 —</option>';
+    return;
+  }
+  sel.innerHTML = state.versions
+    .map((v) => `<option value="${v.id}">#${v.id} ${esc(v.label)}（${v.cue_count} 条 Cue）</option>`)
+    .join('');
+}
+
+async function loadRecordList({ preserveOpen = false } = {}) {
+  const openId = state.record?.id;
+  state.records = await api('GET', '/api/records');
+  renderRecordTable();
+  renderRecordVersionOptions();
+  if (preserveOpen && openId && state.records.some((r) => r.id === openId)) {
+    await loadRecord(openId, false); // 追加成功后用服务器返回的新修订号刷新详情
+  }
+}
+
+function renderRecordTable() {
+  const tb = $('record-table').querySelector('tbody');
+  if (state.records.length === 0) {
+    tb.innerHTML = '<tr><td colspan="7" class="muted">还没有调光记录。</td></tr>';
+    return;
+  }
+  tb.innerHTML = state.records
+    .map(
+      (r) => `
+      <tr class="${state.record && state.record.id === r.id ? 'fading' : ''}">
+        <td>#${r.id}</td>
+        <td>${esc(r.label)}</td>
+        <td>#${r.version_id} ${esc(r.version_label)}</td>
+        <td>${r.revision}</td>
+        <td>${r.op_count}</td>
+        <td>${new Date(r.created_at * 1000).toLocaleString('zh-CN', { hour12: false })}</td>
+        <td>
+          <button data-open-record="${r.id}">打开</button>
+          <button class="danger" data-del-record="${r.id}">删除</button>
+        </td>
+      </tr>`
+    )
+    .join('');
+}
+
+async function loadRecord(id, resetTime) {
+  clearErr($('op-error'));
+  const d = await api('GET', `/api/records/${id}`);
+  const baseCues = Engine.prepareCues(d.cues);
+  state.record = { ...d, baseCues, byLight: Engine.prepareOverrides(d.ops, baseCues) };
+  $('record-workspace').hidden = false;
+  renderRecordTable();
+  renderOpFormLights();
+  renderOps();
+  renderRecordMeta();
+  const maxT = Math.max(
+    Engine.showDuration(baseCues),
+    ...d.ops.map((o) => o.time + o.duration),
+    0
+  );
+  $('rec-timeline').max = String(maxT);
+  if (resetTime) state.recordTime = 0;
+  renderRecordOutput();
+}
+
+function renderRecordMeta() {
+  const r = state.record;
+  $('rec-title').textContent = `调光记录 #${r.id}：${r.label}`;
+  $('rec-meta').textContent =
+    `绑定版本 #${r.version.id}（${r.version.label}，${r.version.cue_count} 条 Cue） · ` +
+    `当前修订号 ${r.revision} · ${r.ops.length} 条操作 · 快照已冻结，草稿与新版本不影响本记录`;
+}
+
+function renderOpFormLights() {
+  $('op-light').innerHTML = state.record.lights
+    .map((l) => `<option value="${l.id}">#${l.id} ${esc(l.name)}</option>`)
+    .join('');
+  // 默认时码预填为末项时码，方便连续追加
+  const last = state.record.ops[state.record.ops.length - 1];
+  if (last) $('op-time').value = String(last.time);
+}
+
+$('op-type').addEventListener('change', (e) => {
+  $('op-target').disabled = e.target.value !== 'override';
+});
+
+$('form-record-create').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  clearErr($('record-create-error'));
+  const version_id = $('rec-version').value;
+  if (!version_id) return showErr($('record-create-error'), '还没有已发布版本，请先到「发布版本」页冻结一版。');
+  try {
+    const r = await api('POST', '/api/records', { version_id, label: $('rec-label').value });
+    $('rec-label').value = '';
+    await loadRecordList();
+    await loadRecord(r.id, true);
+    switchToRecordsTab();
+  } catch (err2) {
+    showErr($('record-create-error'), err2.message);
+  }
+});
+
+$('record-table').addEventListener('click', async (e) => {
+  const openId = e.target.dataset?.openRecord;
+  const delId = e.target.dataset?.delRecord;
+  try {
+    if (openId) {
+      await loadRecord(Number(openId), true);
+      writeHash(openId, 0);
+      switchToRecordsTab();
+    } else if (delId) {
+      if (!confirm(`确认删除调光记录 #${delId}？该记录的全部操作将一并删除。`)) return;
+      await api('DELETE', `/api/records/${delId}`);
+      if (state.record && String(state.record.id) === String(delId)) {
+        state.record = null;
+        $('record-workspace').hidden = true;
+        if (readHash()[HASH_RECORD]) history.replaceState(null, '', window.location.pathname);
+      }
+      await loadRecordList();
+    }
+  } catch (err2) {
+    showErr($('record-create-error'), err2.message);
+  }
+});
+
+function switchToRecordsTab() {
+  document.querySelector('.tab[data-tab="records"]').click();
+}
+
+$('form-op').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const r = state.record;
+  clearErr($('op-error'));
+  const body = {
+    revision: r.revision,
+    op: {
+      light_id: Number($('op-light').value),
+      time: $('op-time').value,
+      op_type: $('op-type').value,
+      duration: $('op-duration').value,
+    },
+  };
+  if (body.op.op_type === 'override') body.op.target = $('op-target').value;
+  try {
+    await appendOpsAndReload([body.op]);
+  } catch (err2) {
+    showErr($('op-error'), '追加失败：' + err2.message);
+  }
+});
+
+// 统一追加入口：携带当前修订号；409 冲突时拉取最新详情（不覆盖查看时刻）后提示重试
+async function appendOpsAndReload(ops) {
+  const r = state.record;
+  try {
+    const d = await api('POST', `/api/records/${r.id}/ops`, { revision: r.revision, ops });
+    state.record = {
+      ...d,
+      baseCues: Engine.prepareCues(d.cues),
+      byLight: Engine.prepareOverrides(d.ops, Engine.prepareCues(d.cues)),
+    };
+    renderRecordTable();
+    renderOps();
+    renderRecordMeta();
+    renderRecordOutput();
+    // 同步列表中的修订号/操作数（不重新拉取详情，避免覆盖查看时刻）
+    const row = state.records.find((x) => x.id === r.id);
+    if (row) {
+      row.revision = d.revision;
+      row.op_count = d.ops.length;
+      renderRecordTable();
+    }
+  } catch (err2) {
+    if (/修订号冲突/.test(err2.message)) {
+      await loadRecord(r.id, false); // 过期：以服务器序列为准重算
+    }
+    throw err2;
+  }
+}
+
+function renderOps() {
+  const nameOf = Object.fromEntries(state.record.lights.map((l) => [l.id, l.name]));
+  $('op-table').querySelector('tbody').innerHTML = state.record.ops
+    .map((o) => {
+      const type =
+        o.op_type === 'override'
+          ? '<span class="badge fading">覆盖</span>'
+          : '<span class="badge done">归还</span>';
+      return `
+        <tr>
+          <td>${o.seq}</td>
+          <td>#${o.light_id} ${esc(nameOf[o.light_id] || '?')}</td>
+          <td>${fmt(o.time)}</td>
+          <td>${type}</td>
+          <td>${o.target === null || o.target === undefined ? '—' : fmt(o.target)}</td>
+          <td>${fmt(o.duration)}</td>
+        </tr>`;
+    })
+    .join('');
+}
+
+$('btn-rec-jump').addEventListener('click', () => {
+  const t = Number($('rec-time').value);
+  if (!Number.isFinite(t)) return showErr($('op-error'), '查看时刻必须是数字。');
+  if (t < 0) return showErr($('op-error'), `非法时码：${$('rec-time').value}（不得为负）。`);
+  state.recordTime = t;
+  renderRecordOutput();
+});
+
+$('rec-timeline').addEventListener('input', (e) => {
+  state.recordTime = Number(e.target.value);
+  renderRecordOutput();
+});
+
+// 实际输出既可用服务器 /output，也可由快照+操作序列在本地重算；此处本地重算（与服务器同一引擎）
+function renderRecordOutput() {
+  const r = state.record;
+  if (!r) return;
+  const t = state.recordTime;
+  $('rec-time').value = String(t);
+  $('rec-timeline').value = String(t);
+  writeHash(r.id, t);
+
+  $('rec-levels').querySelector('tbody').innerHTML = r.lights
+    .map((l) => {
+      const orig = Engine.brightnessAt(r.baseCues, l.id, t);
+      const actual = Engine.overrideBrightnessAt(r.byLight, r.baseCues, l.id, t);
+      const active = Engine.activeOverride(r.byLight, l.id, t);
+      const stateBadge =
+        active === null
+          ? '<span class="badge done">跟随原版</span>'
+          : active.state === 'override'
+            ? '<span class="badge fading">覆盖中</span>'
+            : '<span class="badge waiting">归还融合中</span>';
+      return `
+        <tr class="${active ? 'fading' : ''}">
+          <td>#${l.id} ${esc(l.name)}</td>
+          <td class="muted">${fmt(orig)}</td>
+          <td><b>${fmt(actual)}</b></td>
+          <td>${stateBadge}</td>
+          <td><div class="level-track"><div class="level-fill" style="width:${actual.toFixed(2)}%"></div></div></td>
+        </tr>`;
+    })
+    .join('');
+}
+
 /* ----------------------------- 启动 ----------------------------- */
 
 (async function init() {
   try {
-    [state.lights, state.cues, state.versions] = await Promise.all([
+    [state.lights, state.cues, state.versions, state.records] = await Promise.all([
       api('GET', '/api/lights'),
       api('GET', '/api/cues'),
       api('GET', '/api/versions'),
+      api('GET', '/api/records'),
     ]);
     renderLights();
     renderLightOptions();
@@ -551,6 +827,24 @@ function renderCompare(d) {
     renderVersions();
     renderVersionOptions(null);
     renderCompareOptions();
+    renderRecordVersionOptions();
+    renderRecordTable();
+
+    // 刷新后按 #record=<id>&t=<time> 重算该记录
+    const hash = readHash();
+    if (hash[HASH_RECORD]) {
+      const rid = Number(hash[HASH_RECORD]);
+      if (state.records.some((r) => r.id === rid)) {
+        switchToRecordsTab();
+        await loadRecord(rid, true);
+        const t = Number(hash[HASH_TIME]);
+        if (Number.isFinite(t) && t >= 0) {
+          state.recordTime = t;
+          renderRecordOutput();
+        }
+      }
+    }
+
     if (state.versions.length > 0) {
       await loadSession(state.versions[0].id, true); // 默认加载最新版本，停在 0 秒
     } else {

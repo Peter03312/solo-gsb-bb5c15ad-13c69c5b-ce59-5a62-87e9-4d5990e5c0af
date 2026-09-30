@@ -435,6 +435,293 @@ function handleCompare(req, res) {
 app.get('/api/compare', handleCompare);
 app.post('/api/compare', handleCompare);
 
+/* ------------------------- 临时调光记录（覆盖/归还） ------------------------- */
+// 记录绑定已发布版本快照：原版 Cue 始终取快照在后台运行，草稿修改与新版本发布均不影响既有记录。
+// 每次追加成功 revision + 1；提交须携带当前修订号，过期返回 409 且整次提交不写入。
+
+function loadRecordMeta(recordId) {
+  return db
+    .prepare(
+      `SELECT r.id, r.version_id, r.label, r.created_at, r.revision,
+              v.label AS version_label
+       FROM rehearsal_records r JOIN versions v ON v.id = r.version_id
+       WHERE r.id = ?`
+    )
+    .get(recordId);
+}
+
+function loadRecordOps(recordId) {
+  return db
+    .prepare(
+      `SELECT seq, light_id, time, op_type, target, duration
+       FROM record_ops WHERE record_id = ? ORDER BY seq ASC`
+    )
+    .all(recordId);
+}
+
+function readRecordOp(row) {
+  return {
+    seq: row.seq,
+    light_id: row.light_id,
+    time: row.time,
+    op_type: row.op_type,
+    target: row.target,
+    duration: row.duration,
+  };
+}
+
+app.post('/api/records', (req, res) => {
+  const versionId = toPosInt(req.body?.version_id);
+  if (Number.isNaN(versionId)) {
+    return err(res, 400, `版本编号无效：${JSON.stringify(req.body?.version_id)}（须为已发布版本的正整数编号）`);
+  }
+  const version = db.prepare('SELECT id FROM versions WHERE id = ?').get(versionId);
+  if (!version) return err(res, 404, `版本不存在：#${versionId}，无法为其建立调光记录`);
+
+  const labelRaw = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
+  const label = labelRaw || `临时调光记录 ${new Date().toLocaleString('zh-CN', { hour12: false })}`;
+
+  const info = db
+    .prepare('INSERT INTO rehearsal_records (version_id, label, created_at, revision) VALUES (?, ?, ?, 0)')
+    .run(versionId, label, Date.now() / 1000);
+
+  res.status(201).json(loadRecordDetail(info.lastInsertRowid));
+});
+
+// 记录完整内容（元数据 + 操作序列 + 绑定的版本快照）：刷新/跳转后前端据此重算
+function loadRecordDetail(recordId, res) {
+  const meta = loadRecordMeta(recordId);
+  if (!meta) {
+    if (res) return err(res, 404, `调光记录 ${recordId} 不存在`);
+    return null;
+  }
+  const snap = loadVersionSnapshot(meta.version_id);
+  return {
+    id: meta.id,
+    label: meta.label,
+    created_at: meta.created_at,
+    revision: meta.revision,
+    version: { id: snap.id, label: snap.label, cue_count: snap.cue_count },
+    lights: snap.lights,
+    cues: snap.cues,
+    ops: loadRecordOps(recordId).map(readRecordOp),
+  };
+}
+
+app.get('/api/records', (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT r.id, r.version_id, r.label, r.created_at, r.revision,
+              v.label AS version_label,
+              (SELECT COUNT(*) FROM record_ops o WHERE o.record_id = r.id) AS op_count
+       FROM rehearsal_records r JOIN versions v ON v.id = r.version_id
+       ORDER BY r.id DESC`
+    )
+    .all();
+  res.json(
+    rows.map((r) => ({
+      id: r.id,
+      version_id: r.version_id,
+      version_label: r.version_label,
+      label: r.label,
+      created_at: r.created_at,
+      revision: r.revision,
+      op_count: r.op_count,
+    }))
+  );
+});
+
+app.get('/api/records/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const detail = loadRecordDetail(id, res);
+  if (detail) res.json(detail);
+});
+
+app.delete('/api/records/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const meta = db.prepare('SELECT id FROM rehearsal_records WHERE id = ?').get(id);
+  if (!meta) return err(res, 404, `调光记录 ${id} 不存在`);
+  db.prepare('DELETE FROM rehearsal_records WHERE id = ?').run(id); // 操作级联删除
+  res.status(204).end();
+});
+
+/**
+ * 校验一条调光操作。snapshotLightIds 为绑定版本快照中的灯具编号集合。
+ * 返回 { value } 或 { error }。
+ */
+function validateRecordOp(input, snapshotLightIds) {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    return { error: '操作必须是一个对象' };
+  }
+
+  const lightId = toPosInt(input.light_id);
+  if (Number.isNaN(lightId)) {
+    return { error: `灯具编号无效：${JSON.stringify(input.light_id)}（须为正整数）` };
+  }
+  if (!snapshotLightIds.has(lightId)) {
+    return { error: `灯具 #${lightId} 不在绑定的版本快照中（仅可操作该版本发布时存在的灯具）` };
+  }
+
+  const time = toNum(input.time);
+  if (Number.isNaN(time)) {
+    return { error: `非法时码：${JSON.stringify(input.time)}（须为非负数字秒数）` };
+  }
+  if (time < 0) return { error: `非法时码：${time}（不得为负）` };
+
+  const opType = input.op_type;
+  if (opType !== 'override' && opType !== 'return') {
+    return { error: `非法操作类型：${JSON.stringify(opType)}（须为 "override" 覆盖 或 "return" 归还）` };
+  }
+
+  const duration = toNum(input.duration);
+  if (Number.isNaN(duration)) {
+    return { error: `非法时长：${JSON.stringify(input.duration)}（须为非负数字秒数）` };
+  }
+  if (duration < 0) return { error: `非法时长：${duration}（不得为负）` };
+
+  const value = { light_id: lightId, time, op_type: opType, duration, target: null };
+
+  if (opType === 'override') {
+    const target = toNum(input.target);
+    if (Number.isNaN(target)) {
+      return { error: `覆盖操作缺少有效目标亮度：${JSON.stringify(input.target)}（须为 0～100 的数字）` };
+    }
+    if (target < 0 || target > 100) {
+      return { error: `覆盖目标亮度越界：${target}（须在 0～100 之间）` };
+    }
+    value.target = target;
+  } else if (input.target !== undefined && input.target !== null) {
+    return { error: '归还操作不接受目标亮度（只需时码与时长，结束后完全跟随原版）' };
+  }
+
+  return { value };
+}
+
+// 追加操作：接受单条对象或数组（整批一次提交，任一非法则整批不写入）
+app.post('/api/records/:id/ops', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const meta = db.prepare('SELECT * FROM rehearsal_records WHERE id = ?').get(id);
+  if (!meta) return err(res, 404, `调光记录 ${id} 不存在`);
+
+  // 修订号：必须携带且与当前一致
+  if (req.body === null || typeof req.body !== 'object' || !('revision' in req.body)) {
+    return err(res, 400, '提交必须携带记录修订号 revision（与服务器当前修订号一致才允许追加）');
+  }
+  const clientRev = toNum(req.body.revision);
+  if (!Number.isInteger(clientRev) || clientRev < 0) {
+    return err(res, 400, `修订号无效：${JSON.stringify(req.body.revision)}（须为非负整数）`);
+  }
+  if (clientRev !== meta.revision) {
+    return err(
+      res,
+      409,
+      `修订号冲突：提交基于修订号 ${clientRev}，记录当前已为修订号 ${meta.revision}；请刷新操作序列后重试（本次未写入）`
+    );
+  }
+
+  const rows = Array.isArray(req.body.ops) ? req.body.ops : [req.body.op !== undefined ? req.body.op : null];
+  if (!Array.isArray(req.body.ops) && req.body.op === undefined) {
+    return err(res, 400, '提交缺少操作内容：请提供单个 op 对象或 ops 数组');
+  }
+  if (rows.length === 0) return err(res, 400, '操作数组为空，没有可追加的内容');
+
+  const snapshotLightIds = new Set(
+    db.prepare('SELECT light_id FROM version_lights WHERE version_id = ?').all(meta.version_id).map((r) => r.light_id)
+  );
+
+  // 时码不早于末项：先对库内末项比较，批内再逐条比较
+  let lastRow = db
+    .prepare('SELECT time FROM record_ops WHERE record_id = ? ORDER BY seq DESC LIMIT 1')
+    .get(id);
+  let minTime = lastRow ? lastRow.time : null;
+
+  const parsed = [];
+  for (let i = 0; i < rows.length; i++) {
+    const prefix = Array.isArray(req.body.ops) ? `第 ${i + 1} 条操作：` : '';
+    const r = validateRecordOp(rows[i], snapshotLightIds);
+    if (r.error) return err(res, 400, prefix + r.error + '（整次提交已拒绝，未写入任何操作）');
+    if (minTime !== null && r.value.time < minTime - 1e-9) {
+      return err(
+        res,
+        400,
+        `${prefix}时码 ${r.value.time} 早于上一操作时码 ${minTime}：仅允许追加不早于末项的操作（整次提交已拒绝）`
+      );
+    }
+    minTime = r.value.time;
+    parsed.push(r.value);
+  }
+
+  const tx = db.transaction(() => {
+    // 事务内复查修订号，杜绝并发覆盖（better-sqlite3 同步执行，此处为双保险）
+    const cur = db.prepare('SELECT revision FROM rehearsal_records WHERE id = ?').get(id);
+    if (cur.revision !== clientRev) {
+      const e = new Error(`REVISION_CONFLICT:${cur.revision}`);
+      e.code = 'REVISION_CONFLICT';
+      e.current = cur.revision;
+      throw e;
+    }
+    const maxSeq =
+      db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM record_ops WHERE record_id = ?').get(id).m;
+    const ins = db.prepare(
+      'INSERT INTO record_ops (record_id, seq, light_id, time, op_type, target, duration) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    );
+    parsed.forEach((v, i) => {
+      ins.run(id, maxSeq + i + 1, v.light_id, v.time, v.op_type, v.target, v.duration);
+    });
+    db.prepare('UPDATE rehearsal_records SET revision = revision + 1 WHERE id = ?').run(id);
+  });
+
+  try {
+    tx();
+  } catch (e) {
+    if (e.code === 'REVISION_CONFLICT') {
+      return err(res, 409, `修订号冲突：记录当前修订号为 ${e.current}（本次未写入）`);
+    }
+    throw e;
+  }
+
+  res.status(201).json(loadRecordDetail(id, res));
+});
+
+// 查看任意时刻的逐灯实际输出（原版在后台运行，叠加覆盖/归还操作序列后重算）
+app.get('/api/records/:id/output', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const meta = loadRecordMeta(id);
+  if (!meta) return err(res, 404, `调光记录 ${id} 不存在`);
+
+  const at = toNum(req.query.at);
+  if (Number.isNaN(at)) {
+    return err(res, 400, `查看时刻无效：${JSON.stringify(req.query.at)}（须为非负数字秒数）`);
+  }
+  if (at < 0) return err(res, 400, `查看时刻无效：${at}（不得为负）`);
+
+  const snap = loadVersionSnapshot(meta.version_id);
+  const baseCues = Engine.prepareCues(snap.cues);
+  const byLight = Engine.prepareOverrides(loadRecordOps(id), baseCues);
+
+  const levels = snap.lights.map((l) => {
+    const original = Engine.brightnessAt(baseCues, l.id, at);
+    const actual = Engine.overrideBrightnessAt(byLight, baseCues, l.id, at);
+    const active = Engine.activeOverride(byLight, l.id, at);
+    return {
+      light_id: l.id,
+      name: l.name,
+      original: round6(original),
+      actual: round6(actual),
+      overridden: Math.abs(actual - original) > 1e-9 || active !== null,
+      state: active ? active.state : 'original', // override 覆盖中 / return 归还融合中 / original 跟随原版
+      active_seq: active ? active.seq : null,
+    };
+  });
+
+  res.json({
+    record: { id: meta.id, label: meta.label, revision: meta.revision },
+    version: { id: snap.id, label: snap.label },
+    at,
+    levels,
+  });
+});
+
 /* ------------------------------- 错误处理 ------------------------------ */
 
 // JSON 解析失败（如非法时码导致的畸形 JSON 之外的格式错误）

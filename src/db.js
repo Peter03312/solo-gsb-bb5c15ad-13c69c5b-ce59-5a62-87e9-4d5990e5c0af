@@ -51,6 +51,30 @@ CREATE TABLE IF NOT EXISTS version_cues (
 );
 
 CREATE INDEX IF NOT EXISTS idx_version_cues ON version_cues (version_id, time, cue_no);
+
+-- 临时调光记录：针对已发布版本建立，绑定版本快照，独立于草稿
+CREATE TABLE IF NOT EXISTS rehearsal_records (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id INTEGER NOT NULL REFERENCES versions(id),
+  label      TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  revision   INTEGER NOT NULL DEFAULT 0  -- 操作序列修订号：成功追加次数，过期提交按它判冲突
+);
+
+-- 记录中的操作序列（按 seq 追加顺序；同秒操作也按 seq 顺序生效）
+CREATE TABLE IF NOT EXISTS record_ops (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_id  INTEGER NOT NULL REFERENCES rehearsal_records(id) ON DELETE CASCADE,
+  seq        INTEGER NOT NULL,
+  light_id   INTEGER NOT NULL,
+  time       REAL NOT NULL CHECK (time >= 0),
+  op_type    TEXT NOT NULL CHECK (op_type IN ('override', 'return')),
+  target     REAL,                       -- 仅 override 需要：0～100 目标亮度
+  duration   REAL NOT NULL CHECK (duration >= 0),
+  UNIQUE (record_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_record_ops ON record_ops (record_id, seq);
 `;
 
 let db;

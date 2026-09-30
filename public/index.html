@@ -11,6 +11,7 @@
     <h1>🎭 小剧场灯光 Cue 排演</h1>
     <nav class="tabs">
       <button class="tab active" data-tab="player">排演播放</button>
+      <button class="tab" data-tab="records">调光记录</button>
       <button class="tab" data-tab="compare">版本比对</button>
       <button class="tab" data-tab="lights">灯具录入</button>
       <button class="tab" data-tab="cues">草稿 Cue</button>
@@ -132,6 +133,95 @@
         <div class="card">
           <h2>配置差异（仅在一版存在的灯具，不视为熄灭）</h2>
           <div id="cmp-config"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================ 调光记录 ============================ -->
+    <section id="tab-records" class="tab-panel">
+      <div class="card">
+        <h2>建立临时调光记录</h2>
+        <p class="muted">
+          针对<strong>已发布版本</strong>建立独立的临时调光记录。记录一经建立即绑定该版本快照：
+          原版 Cue 仍按既有规则在后台运行，之后修改草稿或发布新版本都不会改变本记录。
+          跳转或刷新页面后，将依据快照与操作序列<strong>重算</strong>任意时刻的逐灯实际输出。
+        </p>
+        <form id="form-record-create" class="inline-form">
+          <select id="rec-version" required style="min-width:16rem"></select>
+          <input type="text" id="rec-label" placeholder="记录备注（可留空）" />
+          <button class="primary" type="submit">➕ 建立调光记录</button>
+        </form>
+        <div id="record-create-error" class="error-line" hidden></div>
+
+        <h3>已有记录</h3>
+        <div class="table-wrap">
+          <table id="record-table">
+            <thead><tr><th>#</th><th>备注</th><th>绑定版本</th><th>修订号</th><th>操作数</th><th>建立时间</th><th>操作</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="record-workspace" hidden>
+        <div class="card">
+          <h2 id="rec-title">记录详情</h2>
+          <p class="muted" id="rec-meta"></p>
+          <h3>追加操作（覆盖 / 归还）</h3>
+          <p class="muted">
+            按演出时码追加指定灯具的操作。<strong>覆盖</strong>从操作瞬间的实际输出线性渐变到 0～100 目标亮度，此后保持；
+            <strong>归还</strong>以操作瞬间实际输出为起点，在时长内按进度与持续变化的原版亮度线性融合，结束后完全跟随原版；
+            0 秒操作立即生效，下一操作可接管未完成的渐变。时码不得早于上一条操作，同秒按追加顺序生效。
+          </p>
+          <form id="form-op" class="cue-form">
+            <label>灯具
+              <select id="op-light" required></select>
+            </label>
+            <label>时码 (s) <input type="number" id="op-time" min="0" step="0.1" value="0" required /></label>
+            <label>类型
+              <select id="op-type">
+                <option value="override">覆盖 override</option>
+                <option value="return">归还 return</option>
+              </select>
+            </label>
+            <label>目标亮度（仅覆盖） <input type="number" id="op-target" min="0" max="100" step="0.1" value="80" /></label>
+            <label>时长 (s) <input type="number" id="op-duration" min="0" step="0.1" value="2" required /></label>
+            <button class="primary" type="submit">追加操作</button>
+          </form>
+          <div id="op-error" class="error-line" hidden></div>
+        </div>
+
+        <div class="card">
+          <h2>任意时刻逐灯实际输出</h2>
+          <div class="row transport">
+            <label class="jump">查看时刻
+              <input id="rec-time" type="number" min="0" step="0.1" style="width:6rem" /> 秒
+            </label>
+            <button id="btn-rec-jump">跳转</button>
+            <span class="muted">基于绑定快照与全部操作序列重算；原版在后台继续运行。</span>
+          </div>
+          <div class="row">
+            <input id="rec-timeline" type="range" min="0" max="0" step="0.01" value="0" style="flex:1" />
+          </div>
+          <div class="table-wrap">
+            <table id="rec-levels">
+              <thead>
+                <tr><th>灯具</th><th>原版亮度</th><th>实际输出</th><th>状态</th><th>亮度条</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>操作序列（同秒按追加顺序生效）</h2>
+          <div class="table-wrap">
+            <table id="op-table">
+              <thead>
+                <tr><th>序号</th><th>灯具</th><th>时码(s)</th><th>类型</th><th>目标亮度</th><th>时长(s)</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </section>

@@ -258,7 +258,123 @@
       pushLinearPieces(pieces, la.a - lb.a, la.b - lb.b, u, v, threshold);
     }
 
-    return unionPieces(pieces);
+  return unionPieces(pieces);
+  }
+
+  /* --------------------- 临时调光（覆盖 / 归还）记录 --------------------- */
+
+  /**
+   * 段 seg 在时刻 t 的输出。仅依赖 seg.from（准备阶段已按前一段算好）与原版亮度，
+   * 无需继续向前追溯：中途接管时 seg.from 就是接管起点。
+   */
+  function segOutput(seg, t, baseCues) {
+    const base = (tt) => brightnessAt(baseCues, seg.lightId, tt);
+    if (seg.duration === 0) {
+      // 0 秒操作立即生效：覆盖跳到目标；归还是一条立即完成的融合，此后完全跟随原版
+      return seg.opType === 'override' ? seg.target : base(t);
+    }
+    if (t <= seg.time) return seg.from;
+    if (t >= seg.end) {
+      // 覆盖到达目标后保持；归还结束后完全跟随原版
+      return seg.opType === 'override' ? seg.target : base(t);
+    }
+    const k = (t - seg.time) / seg.duration;
+    if (seg.opType === 'override') {
+      return clamp(seg.from + (seg.target - seg.from) * k);
+    }
+    // 归还：按进度与该时刻持续变化的原版亮度线性融合
+    return clamp(seg.from + (base(t) - seg.from) * k);
+  }
+
+  /**
+   * 展开一份临时调光记录的操作序列。
+   *
+   * 操作字段：{ seq, light_id, time, op_type: 'override'|'return', target?, duration }
+   * 原版 Cue 仍按既有规则在后台运行（baseCues 为 prepareCues 的结果）。
+   *
+   * 规则：
+   *  - 覆盖(override)：从操作瞬间的【实际输出】线性渐变到 target（0～100），此后保持，
+   *    直到被后续操作接管；duration 为 0 立即生效。
+   *  - 归还(return)：以操作瞬间的【实际输出】为起点，在 duration 内按进度
+   *    与该时刻【持续变化的原版亮度】线性融合（凸组合），结束后完全跟随原版。
+   *  - 下一操作可在渐变未完成时接管，起点一律取该时刻实际输出（不跳变、不重置）；
+   *    同一时刻（同秒）的多条操作按 seq 追加顺序逐条生效（与 Cue 同秒编号顺序同理）。
+   *
+   * 返回按灯具分组的段数组（保持全局 time, seq 顺序），每段预存起始亮度 from。
+   */
+  function prepareOverrides(ops, baseCues) {
+    const ordered = ops
+      .map((o) => ({
+        seq: Number(o.seq),
+        lightId: Number(o.light_id),
+        time: Number(o.time),
+        opType: o.op_type,
+        target: o.op_type === 'override' ? clamp(Number(o.target)) : null,
+        duration: Number(o.duration),
+        end: Number(o.time) + Number(o.duration),
+        from: 0, // 操作瞬间的实际输出，下面逐条计算
+      }))
+      .sort((a, b) => a.time - b.time || a.seq - b.seq);
+
+    const last = new Map(); // 每盏灯的上一段（已按 time, seq 排好序）
+    for (const seg of ordered) {
+      const prev = last.get(seg.lightId);
+      if (!prev) {
+        seg.from = brightnessAt(baseCues, seg.lightId, seg.time);
+      } else {
+        // 含中途接管（此刻上一段仍在渐变中）与同秒顺序（0 秒操作已生效、普通渐变 k=0）
+        seg.from = segOutput(prev, seg.time, baseCues);
+      }
+      last.set(seg.lightId, seg);
+    }
+
+    const byLight = new Map();
+    for (const seg of ordered) {
+      if (!byLight.has(seg.lightId)) byLight.set(seg.lightId, []);
+      byLight.get(seg.lightId).push(seg);
+    }
+    return byLight;
+  }
+
+  /** 某盏灯在临时调光记录下 t 时刻的实际输出 */
+  function overrideBrightnessAt(byLight, baseCues, lightId, t) {
+    const segs = byLight.get(lightId);
+    if (!segs) return brightnessAt(baseCues, lightId, t);
+    let active = null;
+    for (const seg of segs) {
+      if (seg.time > t) break; // 已按 time, seq 排序
+      active = seg;
+    }
+    if (!active) return brightnessAt(baseCues, lightId, t);
+    return segOutput(active, t, baseCues);
+  }
+
+  /**
+   * 某盏灯在 t 时刻是否处于临时接管状态，供界面标注：
+   * 'override'（覆盖保持/渐变中）| 'return'（归还融合中）| null（完全跟随原版）。
+   * 0 秒归还立即完成，除操作瞬间外均跟随原版，状态按 null 处理。
+   */
+  function activeOverride(byLight, lightId, t) {
+    const segs = byLight.get(lightId);
+    if (!segs) return null;
+    let active = null;
+    for (const seg of segs) {
+      if (seg.time > t) break;
+      active = seg;
+    }
+    if (!active) return null;
+    if (active.opType === 'override') return { seg: active, state: 'override' };
+    if (active.duration > 0 && t < active.end) return { seg: active, state: 'return' };
+    return null;
+  }
+
+  /** 记录下整场（快照灯具）在 t 时刻的逐灯实际输出表 */
+  function overrideLevelsAt(byLight, baseCues, lights, t) {
+    const out = {};
+    for (const l of lights) {
+      out[l.id] = overrideBrightnessAt(byLight, baseCues, l.id, t);
+    }
+    return out;
   }
 
   return {
@@ -268,5 +384,9 @@
     levelsAt,
     showDuration,
     differenceIntervals,
+    prepareOverrides,
+    overrideBrightnessAt,
+    overrideLevelsAt,
+    activeOverride,
   };
 });
